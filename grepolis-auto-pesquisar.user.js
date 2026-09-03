@@ -1,453 +1,193 @@
 // ==UserScript==
-// @name         4 DEVICE AUTO-PESQUISAR
-// @version      2.1
-// @description  Planejador de pesquisas por cidade para NC (Integrado ao Humanizer)
+// @name         4 DEVICE AUTO-PESQUISAR (Integrado à Central)
+// @version      2.2
+// @description  Automatiza pesquisas na Academia utilizando a fila e o humanizador da DeviceCentral.
 // @author       device
-// @include      http://*.grepolis.com/game/*
-// @include      https://*.grepolis.com/game/*
-// @exclude      view-source://*
+// @match        http://*.grepolis.com/game/*
+// @match        https://*.grepolis.com/game/*
 // @grant        unsafeWindow
 // @run-at       document-idle
 // ==/UserScript==
 
-(async function () {
+(function () {
     'use strict';
 
-    const uw = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
-    if (!uw.location.pathname.includes("game")) return;
+    const MODULE_NAME = "AutoResearch";
 
-    const MODULE_NAME = 'AutoPesquisar';
+    // Mapeamento padrão de pesquisas caso o usuário não tenha configurado no localStorage
+    const DEFAULT_CONQUEST_RESEARCH = [
+        'slinger', 'town_guard', 'architecture', 'bireme', 'mathematics',
+        'pioneer', 'meteorology', 'crane', 'conquest', 'trireme',
+        'colony_ship', 'demolition_expert', 'cryptography', 'phalanx', 'ram',
+        'cartography', 'astrology', 'pottery', 'watchtower', 'instructors', 'plow'
+    ];
 
-    function sleep(ms) {
-        return new Promise(resolve => setTimeout(resolve, ms));
+    const DEFAULT_REVOLT_RESEARCH = [
+        'slinger', 'town_guard', 'architecture', 'bireme', 'mathematics',
+        'pioneer', 'meteorology', 'crane', 'democracy', 'trireme',
+        'colony_ship', 'demolition_expert', 'cryptography', 'phalanx', 'ram',
+        'cartography', 'astrology', 'pottery', 'watchtower', 'instructors', 'plow'
+    ];
+
+    function getStorageKey() {
+        const uw = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+        const player = (uw.Game && uw.Game.player_id) ? uw.Game.player_id : 'default';
+        const world = (uw.Game && uw.Game.world_id) ? uw.Game.world_id : 'default';
+        return `GAP_researchQueue_${world}_${player}`;
     }
-    await sleep(3000);
 
-    if (!uw.Game || !uw.Game.world_id) return;
-
-    const STORAGE_KEY = uw.Game.world_id + "_RESEARCHES";
-    let currentResearchIndex = 0;
-    let currentAcademyWindow = null;
-    let academyObserver = null;
-    let usedForMultiAccounting = true;
-
-    function getConquestMode(research) {
+    function getResearchQueue() {
         try {
-            const css = uw.GameDataResearches.getResearchCssClass(research);
-            return css === 'take_over_old' ? 'cerco' : 'revolta';
+            const saved = localStorage.getItem(getStorageKey());
+            if (saved) return JSON.parse(saved);
         } catch (e) {
-            return 'desconhecido';
-        }
-    }
-
-    console.log(`%c[${MODULE_NAME}] Ativo e integrado à Central do Humanizador.`, 'color: #ff9800; font-weight: bold;');
-
-    if (usedForMultiAccounting) {
-        const predefinedResearches = [
-            "slinger", "town_guard", "booty_bpv", "architecture", "shipwright", "building_crane", "bireme",
-            "colonize_ship", getConquestMode("take_over") === "cerco" ? "democracy" : "",
-            "mathematics", "cartography", "set_sail", "strong_wine", "plow", "pottery", "combat_experience"
-        ].filter(Boolean);
-
-        const allTowns = uw.ITowns && uw.ITowns.towns ? uw.ITowns.towns : {};
-
-        $.each(allTowns, function (id, town) {
-            try {
-                const all = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
-                const existingResearches = all[id] || [];
-
-                if (existingResearches.length === 0) {
-                    all[id] = [...predefinedResearches];
-                    localStorage.setItem(STORAGE_KEY, JSON.stringify(all));
-                }
-            } catch (e) {
-                console.error(`[${MODULE_NAME}] Erro ao inicializar localStorage para cidade:`, id, e);
-            }
-        });
-    }
-
-    $("head").append(`
-        <style>
-            .GAP_highlight_inactive::after {
-                content: '';
-                position: absolute;
-                width: 100%;
-                height: 100%;
-                background-color: rgba(0, 255, 0, 0.5);
-            }
-            .GAP_highlight_active {
-                border: 1px solid rgba(0, 255, 0, 1);
-            }
-        </style>
-    `);
-
-    if (uw.GameEvents && uw.GameEvents.game && uw.GameEvents.game.load) {
-        $.Observer(uw.GameEvents.game.load).subscribe("GAP_load", attachAjaxListener);
-    }
-
-    if (uw.GameEvents && uw.GameEvents.window && uw.GameEvents.window.open) {
-        $.Observer(uw.GameEvents.window.open).subscribe("GAP_window_open", (e, wnd) => {
-            if (!wnd || typeof wnd.getType !== 'function' || !wnd.cid) return;
-            if (wnd.getType() === "academy") {
-                currentAcademyWindow = wnd;
-                openAcademy(wnd);
-            }
-        });
-    }
-
-    if (uw.GameEvents && uw.GameEvents.town && uw.GameEvents.town.town_switch) {
-        $.Observer(uw.GameEvents.town.town_switch).subscribe("GAP_town_switch", resetAcademy);
-    }
-
-    if (uw.GameEvents && uw.GameEvents.window && uw.GameEvents.window.close) {
-        $.Observer(uw.GameEvents.window.close).subscribe("GAP_window_close", (e, wnd) => {
-            if (wnd && typeof wnd.getType === 'function' && wnd.getType() === "academy") {
-                currentAcademyWindow = null;
-                if (academyObserver) {
-                    academyObserver.disconnect();
-                    academyObserver = null;
-                }
-            }
-        });
-    }
-
-    // Função de execução processada pela Fila da Central do Humanizador
-    async function processResearchTick() {
-        try {
-            const all = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
-
-            for (const [townId, researches] of Object.entries(all)) {
-                if (!Array.isArray(researches) || researches.length === 0) continue;
-                const index = currentResearchIndex % researches.length;
-                const research = researches[index];
-                await tryAutoResearch(research, parseInt(townId));
-            }
-
-            currentResearchIndex++;
-        } catch (e) {
-            console.error(`[${MODULE_NAME}] Erro no loop de intervalo:`, e);
-        }
-    }
-
-    // Inicialização segura utilizando o DeviceCentral (Fila e Semáforo)
-    function initDeviceIntegration() {
-        if (uw.DeviceCentral && typeof uw.DeviceCentral.requestQueue === 'function') {
-            setInterval(() => {
-                // Envia a verificação de pesquisas para a fila controlada da central
-                uw.DeviceCentral.requestQueue(MODULE_NAME, async () => {
-                    await processResearchTick();
-                });
-            }, 60000); // Roda a cada 1 minuto (a fila gerencia o momento exato de disparar)
-        } else {
-            setTimeout(initDeviceIntegration, 2000);
-        }
-    }
-
-    initDeviceIntegration();
-
-    function attachAjaxListener() {
-        $(document).ajaxComplete((e, xhr, opt) => {
-            try {
-                if (!opt || !opt.url) return;
-                let urlParts = opt.url.split("?");
-                if (!urlParts[1]) return;
-                const url = new URL("https://dummy/?" + urlParts[1]);
-                const action = urlParts[0].substr(5);
-                if (action === "frontend_bridge/fetch" && url.searchParams.get("window_type") === "academy") {
-                    const wnd = uw.WM && uw.WM.getWindowByType ? uw.WM.getWindowByType("academy")[0] : null;
-                    if (wnd) {
-                        currentAcademyWindow = wnd;
-                        setTimeout(() => openAcademy(wnd), 100);
-                    }
-                }
-            } catch (e) {}
-        });
-    }
-
-    function getTownId() {
-        return uw.Game && uw.Game.townId ? uw.Game.townId : null;
-    }
-
-    function loadResearches() {
-        try {
-            const all = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
-            return all[getTownId()] || [];
-        } catch (e) {
-            return [];
-        }
-    }
-
-    function saveResearches(researches) {
-        try {
-            const all = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
-            all[getTownId()] = researches;
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(all));
-        } catch (e) {}
-    }
-
-    function toggleResearch(research, element, isInactive) {
-        let researches = loadResearches();
-        const index = researches.indexOf(research);
-
-        if (index >= 0) {
-            researches.splice(index, 1);
-            removeClass(element);
-        } else {
-            researches.push(research);
-            if (isInactive) addClassInactive(element);
-            else addClassActive(element);
-            tryAutoResearch(research);
+            console.error(`[${MODULE_NAME}] Erro ao ler fila do localStorage:`, e);
         }
 
-        saveResearches(researches);
+        // Se não houver salvo, inicializa com base no tipo de mundo (Cerco/Conquest ou Revolta)
+        const uw = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+        const isConquest = uw.Game && uw.Game.conquest_type === 'conquest'; 
+        return isConquest ? DEFAULT_CONQUEST_RESEARCH : DEFAULT_REVOLT_RESEARCH;
     }
 
-    async function tryAutoResearch(research, townOverride = null) {
-        const townId = townOverride || getTownId();
-        if (!townId || !uw.ITowns) return;
-
-        const town = uw.ITowns.getTown(townId);
-        if (!town || typeof town.buildings !== 'function') return;
-
-        const buildings = town.buildings();
-        if (!buildings || !buildings.attributes) return;
-
-        const academy = buildings.attributes.academy;
-        if (!academy || !research) return;
-
-        const techs = (typeof town.researches === 'function' && town.researches())
-            ? town.researches().attributes
-            : {};
-
-        const researchOrderColl = uw.MM && uw.MM.getFirstTownAgnosticCollectionByName ? uw.MM.getFirstTownAgnosticCollectionByName("ResearchOrder") : null;
-        const researchesQueue = researchOrderColl && researchOrderColl.fragments && researchOrderColl.fragments[townId] ? researchOrderColl.fragments[townId].models || [] : [];
-        const queueLimit = uw.GameDataPremium && uw.GameDataPremium.isAdvisorActivated && uw.GameDataPremium.isAdvisorActivated('curator') ? 7 : 2;
-        const researchesQueueCount = researchesQueue.length;
-
-        const isAlreadyQueued = researchesQueue.some(model => model && model.attributes && model.attributes.research_type === research);
-        if (isAlreadyQueued) return;
-        if (researchesQueueCount >= queueLimit) return;
-
-        let cleanResearch = research;
-        if (cleanResearch.endsWith("_old")) {
-            cleanResearch = cleanResearch.replace("_old", "");
-        }
-        if (cleanResearch.endsWith("_bpv")) {
-            cleanResearch = cleanResearch.replace("_bpv", "");
-        }
-
-        if (techs[cleanResearch]) {
-            let researches = loadResearches();
-            const index = researches.indexOf(research);
-            if (index >= 0) {
-                researches.splice(index, 1);
-                saveResearches(researches);
-                if (currentAcademyWindow && typeof currentAcademyWindow.getIdentifier === 'function') {
-                    const selector = "#window_" + currentAcademyWindow.getIdentifier();
-                    const researchElement = $(selector).find(`.research.${research}`)[0];
-                    if (researchElement) {
-                        removeClass(researchElement);
-                    }
-                }
+    // Injeta estilos CSS para destacar pesquisas ativas na interface da Academia
+    function injectStyles() {
+        if (document.getElementById('gap-styles')) return;
+        const style = document.createElement('style');
+        style.id = 'gap-styles';
+        style.innerHTML = `
+            .gap_highlight_active {
+                box-shadow: 0 0 10px 3px #00ff00 !important;
+                border: 2px solid #00ff00 !important;
             }
+            .gap_highlight_inactive {
+                opacity: 0.4;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // Executa a lógica principal de envio de requisição de pesquisa à API do jogo
+    async function tryAutoResearch() {
+        const uw = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+
+        // Validações básicas de ambiente e segurança da Central
+        if (!uw.ITowns || !uw.ITowns.getCurrentTown) return;
+        
+        // Verifica se a central global existe
+        if (!uw.DeviceCentral) {
+            console.warn(`[${MODULE_NAME}] DeviceCentral ainda não carregada. Adiando ciclo...`);
             return;
         }
 
-        const reqsTech = uw.GameData && uw.GameData.researches ? uw.GameData.researches[cleanResearch] : null;
-
-        if (!reqsTech) {
-            let researches = loadResearches();
-            const index = researches.indexOf(research);
-            if (index >= 0) {
-                researches.splice(index, 1);
-                saveResearches(researches);
-            }
+        // Se a conta estiver pausada por CAPTCHA ou Farm prioritário rodando, aborta por ora
+        if (uw.DeviceCentral.isFarmActive) {
+            console.log(`[${MODULE_NAME}] Farm prioritário ativo. Auto-Pesquisa aguardando...`);
             return;
         }
 
-        if (reqsTech.building_dependencies && academy < reqsTech.building_dependencies.academy) {
-            return;
+        const currentTown = uw.ITowns.getCurrentTown();
+        if (!currentTown) return;
+
+        const townId = currentTown.getId();
+        
+        // Verifica nível da academia
+        const buildingCounts = currentTown.getBuildings();
+        const academyLevel = buildingCounts && buildingCounts.academy ? buildingCounts.academy : 0;
+        if (academyLevel < 1) return;
+
+        // Verifica se já existe pesquisa em andamento nesta cidade
+        const researchOrders = currentTown.getResearchOrders ? currentTown.getResearchOrders() : [];
+        if (researchOrders && researchOrders.length > 0) {
+            return; // Já tem pesquisa rodando
         }
 
-        let currentTown = uw.ITowns.getTown(townId);
-        if (!currentTown || typeof currentTown.getBuildings !== 'function' || typeof currentTown.getResearches !== 'function') return;
+        // Verifica limite de fila de pesquisas (Ex: Conta comum = 1, com Administrador/Curator = até 5)
+        const maxOrders = (uw.Game && uw.Game.premium_features && uw.Game.premium_features.curator) ? 5 : 1;
+        if (researchOrders.length >= maxOrders) return;
 
-        let availablePoints = currentTown.getBuildings().getBuildingLevel('academy') * (uw.GameDataResearches && uw.GameDataResearches.getResearchPointsPerAcademyLevel ? uw.GameDataResearches.getResearchPointsPerAcademyLevel() : 1);
+        const researchedTechs = currentTown.getResearches ? currentTown.getResearches() : {};
+        const availablePoints = currentTown.getAvailableResearchPoints ? currentTown.getAvailableResearchPoints() : 0;
+        const currentWood = currentTown.wood || 0;
+        const currentStone = currentTown.stone || 0;
+        const currentIron = currentTown.iron || 0;
 
-        if (uw.GameData && uw.GameData.researches) {
-            $.each(uw.GameData.researches, function (ind) {
-                if (currentTown.getResearches().get(ind)) {
-                    availablePoints -= uw.GameData.researches[ind].research_points;
-                }
-            });
-        }
+        const queue = getResearchQueue();
+        
+        // Procura a próxima tecnologia viável na fila
+        for (const techId of queue) {
+            // Se já foi pesquisado, pula
+            if (researchedTechs[techId]) continue;
 
-        availablePoints = Math.max(0, availablePoints);
+            // Busca os dados da tecnologia no Model do Grepolis
+            const techConfig = uw.GameData && uw.GameData.researches ? uw.GameData.researches[techId] : null;
+            if (!techConfig) continue;
 
-        if (availablePoints < reqsTech.research_points) {
-            return;
-        }
+            // Valida requisitos de pontos e recursos
+            const pointsNeeded = techConfig.research_points || 0;
+            const cost = techConfig.resources || {};
+            const woodNeeded = cost.wood || 0;
+            const stoneNeeded = cost.stone || 0;
+            const ironNeeded = cost.iron || 0;
 
-        if (typeof currentTown.resources !== 'function') return;
-        const { wood, stone, iron } = currentTown.resources();
+            if (availablePoints >= pointsNeeded &&
+                currentWood >= woodNeeded &&
+                currentStone >= stoneNeeded &&
+                currentIron >= ironNeeded) {
+                
+                console.log(`[${MODULE_NAME}] Iniciando pesquisa da tecnologia: ${techId} na cidade ${townId}`);
 
-        const margin = 5;
-        if (wood < (reqsTech.resources.wood + margin) ||
-            stone < (reqsTech.resources.stone + margin) ||
-            iron < (reqsTech.resources.iron + margin)) {
-            return;
-        }
-
-        const data = {
-            model_url: "ResearchOrder",
-            action_name: "research",
-            captcha: null,
-            arguments: { id: cleanResearch },
-            town_id: townId,
-            nl_init: true
-        };
-
-        if (uw.gpAjax && typeof uw.gpAjax.ajaxPost === 'function') {
-            uw.gpAjax.ajaxPost("frontend_bridge", "execute", data, false, {
-                success: (resp) => {
-                    let researches = loadResearches();
-                    const index = researches.indexOf(research);
-                    if (index >= 0) {
-                        researches.splice(index, 1);
-                        saveResearches(researches);
-                    }
-                },
-                error: (err) => {}
-            });
-        }
-    }
-
-    function openAcademy(wnd) {
-        if (!wnd || typeof wnd.getIdentifier !== 'function') return;
-        const selector = "#window_" + wnd.getIdentifier();
-        let retries = 0;
-
-        function tryRender() {
-            const techTree = $(selector).find(".tech_tree_box");
-            if (techTree.length === 0) {
-                if (retries++ < 15) return setTimeout(tryRender, 200);
-                return;
-            }
-
-            const saved = loadResearches();
-
-            techTree.find("div.research").each((_, el) => {
-                removeClass(el);
-            });
-
-            techTree.find("div.research").each((_, el) => {
-                const $el = $(el);
-                const classAttr = $el.attr("class");
-                if (!classAttr) return;
-                const classes = classAttr.split(/\s+/);
-                if (classes.length < 3) return;
-                const research = classes[2];
-                const isInactive = $el.hasClass("inactive");
-
-                $el.off("click.GAP").on("click.GAP", (e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    toggleResearch(research, el, isInactive);
-                });
-
-                if (saved.includes(research)) {
-                    if (isInactive) addClassInactive(el);
-                    else addClassActive(el);
-                }
-            });
-
-            setupAcademyObserver(selector);
-        }
-
-        tryRender();
-    }
-
-    function setupAcademyObserver(selector) {
-        if (academyObserver) {
-            academyObserver.disconnect();
-        }
-
-        const windowElement = $(selector)[0];
-        if (!windowElement) return;
-
-        academyObserver = new MutationObserver((mutations) => {
-            let shouldReapply = false;
-
-            mutations.forEach((mutation) => {
-                if (mutation.type === 'childList') {
-                    const addedNodes = Array.from(mutation.addedNodes);
-                    const removedNodes = Array.from(mutation.removedNodes);
-
-                    const techTreeChanged = [...addedNodes, ...removedNodes].some(node => {
-                        if (node.nodeType === 1) {
-                            return node.matches && (
-                                node.matches('.tech_tree_box') ||
-                                (node.querySelector && node.querySelector('.tech_tree_box')) ||
-                                node.matches('.research') ||
-                                (node.querySelector && node.querySelector('.research'))
-                            );
+                // Dispara a requisição de pesquisa via API interna do Grepolis (`gpAjax`)
+                if (uw.gpAjax && typeof uw.gpAjax.ajaxPost === 'function') {
+                    uw.gpAjax.ajaxPost('frontend_bridge', 'execute', {
+                        model_url: `ResearchOrder`,
+                        action_name: 'research',
+                        arguments: {
+                            town_id: townId,
+                            research_type: techId
                         }
-                        return false;
+                    }, 0, {
+                        success: function () {
+                            console.log(`[${MODULE_NAME}] 🧪 Pesquisa [${techId}] iniciada com sucesso!`);
+                        },
+                        error: function (err) {
+                            console.error(`[${MODULE_NAME}] Erro ao iniciar pesquisa [${techId}]:`, err);
+                        }
                     });
-
-                    if (techTreeChanged) {
-                        shouldReapply = true;
-                    }
                 }
-
-                if (mutation.type === 'attributes' && mutation.attributeName === 'class') {
-                    const target = mutation.target;
-                    if (target.matches && (
-                        target.matches('.tab_research') ||
-                        target.matches('.tab_research_queue') ||
-                        target.classList.contains('active')
-                    )) {
-                        shouldReapply = true;
-                    }
-                }
-            });
-
-            if (shouldReapply && currentAcademyWindow) {
-                setTimeout(() => {
-                    if (currentAcademyWindow && typeof currentAcademyWindow.getIdentifier === 'function' && $(selector).length > 0) {
-                        openAcademy(currentAcademyWindow);
-                    }
-                }, 150);
+                break; // Envia apenas uma por ciclo
             }
-        });
-
-        academyObserver.observe(windowElement, {
-            childList: true,
-            subtree: true,
-            attributes: true,
-            attributeFilter: ['class']
-        });
-    }
-
-    function resetAcademy() {
-        if (currentAcademyWindow && typeof currentAcademyWindow.getIdentifier === 'function') {
-            const selector = "#window_" + currentAcademyWindow.getIdentifier();
-            $(selector).find(".tech_tree_box .research").each((_, el) => {
-                removeClass(el);
-            });
-            setTimeout(() => openAcademy(currentAcademyWindow), 100);
         }
     }
 
-    function addClassInactive(el) {
-        $(el).addClass("GAP_highlight_inactive");
+    // Função de loop que se cadastra na fila da DeviceCentral
+    function scheduleAutoResearchLoop() {
+        const uw = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+
+        if (uw.DeviceCentral && typeof uw.DeviceCentral.requestQueue === 'function') {
+            uw.DeviceCentral.requestQueue(MODULE_NAME, async () => {
+                await tryAutoResearch();
+            }).then(() => {
+                // Agenda a próxima checagem em um intervalo seguro (ex: a cada 60 a 90 segundos)
+                const nextCheck = Math.floor(Math.random() * (90000 - 60000 + 1)) + 60000;
+                setTimeout(scheduleAutoResearchLoop, nextCheck);
+            });
+        } else {
+            // Se a central demorar a carregar, tenta novamente em 5 segundos
+            setTimeout(scheduleAutoResearchLoop, 5000);
+        }
     }
 
-    function addClassActive(el) {
-        $(el).addClass("GAP_highlight_active");
-    }
+    // Inicialização do Script
+    setTimeout(() => {
+        const uw = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+        if (!uw.Game || !uw.Game.world_id) return;
 
-    function removeClass(el) {
-        $(el).removeClass("GAP_highlight_inactive GAP_highlight_active");
-    }
+        injectStyles();
+        console.log(`%c[${MODULE_NAME} v2.2] Módulo de Auto-Pesquisa integrado à Central carregado!`, "color: #ff9800; font-weight: bold;");
+
+        // Inicia o loop de requisições conectando-se à fila da central
+        setTimeout(scheduleAutoResearchLoop, 15000);
+    }, 5000);
+
 })();
