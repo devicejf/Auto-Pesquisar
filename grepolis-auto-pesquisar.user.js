@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         4 DEVICE AUTO-PESQUISAR
-// @version      1
-// @description  Planejador de pesquisas por cidade para NC
+// @version      2.1
+// @description  Planejador de pesquisas por cidade para NC (Integrado ao Humanizer)
 // @author       device
 // @include      http://*.grepolis.com/game/*
 // @include      https://*.grepolis.com/game/*
@@ -40,7 +40,7 @@
         }
     }
 
-    console.log(`%c[${MODULE_NAME}] Ativo e executando em modo autônomo.`, 'color: #ff9800; font-weight: bold;');
+    console.log(`%c[${MODULE_NAME}] Ativo e integrado à Central do Humanizador.`, 'color: #ff9800; font-weight: bold;');
 
     if (usedForMultiAccounting) {
         const predefinedResearches = [
@@ -111,8 +111,8 @@
         });
     }
 
-    // Loop principal totalmente independente
-    setInterval(async () => {
+    // Função de execução processada pela Fila da Central do Humanizador
+    async function processResearchTick() {
         try {
             const all = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
 
@@ -127,7 +127,23 @@
         } catch (e) {
             console.error(`[${MODULE_NAME}] Erro no loop de intervalo:`, e);
         }
-    }, 60000);
+    }
+
+    // Inicialização segura utilizando o DeviceCentral (Fila e Semáforo)
+    function initDeviceIntegration() {
+        if (uw.DeviceCentral && typeof uw.DeviceCentral.requestQueue === 'function') {
+            setInterval(() => {
+                // Envia a verificação de pesquisas para a fila controlada da central
+                uw.DeviceCentral.requestQueue(MODULE_NAME, async () => {
+                    await processResearchTick();
+                });
+            }, 60000); // Roda a cada 1 minuto (a fila gerencia o momento exato de disparar)
+        } else {
+            setTimeout(initDeviceIntegration, 2000);
+        }
+    }
+
+    initDeviceIntegration();
 
     function attachAjaxListener() {
         $(document).ajaxComplete((e, xhr, opt) => {
